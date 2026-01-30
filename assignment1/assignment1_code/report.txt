@@ -1,0 +1,183 @@
+ECE1755 Assignment 1: Parallel Beamforming Optimization Report
+
+1. INTRODUCTION
+
+This report describes the optimization of an ultrasound beamforming algorithm for the Intel i7-11700 processor. The goal was to achieve maximum speedup over the baseline single-threaded implementation while maintaining numerical correctness.
+
+The beamforming algorithm processes 6,386,560 image points (1560 × 64 × 64) with 1024 transducers (32 × 32 array). For each image point, the algorithm computes the distance to each transducer, uses this to index into received signal data, and accumulates the contributions from all transducers.
+
+2. TARGET PLATFORM
+
+- Processor: Intel Core i7-11700 (Rocket Lake)
+- Cores: 8 physical cores, 16 threads (Hyper-Threading)
+- SIMD: AVX2 (256-bit vectors), FMA support
+- L1 Cache: 48KB per core
+- L2 Cache: 512KB per core
+- L3 Cache: 16MB shared
+
+3. OPTIMIZATION TECHNIQUES
+
+3.1 Multi-Threading with Pthreads
+
+The workload is parallelized across 16 threads using POSIX threads. Each thread processes a contiguous chunk of image points independently, enabling embarrassingly parallel execution with no synchronization overhead.
+
+CPU affinity is set using pthread_setaffinity_np() to pin threads to specific cores, reducing cache thrashing and context switch overhead.
+
+3.2 AVX2 SIMD Vectorization
+
+The inner loop is vectorized using AVX2 intrinsics to process 8 floating-point values simultaneously:
+
+- __m256 vectors for all floating-point operations
+- _mm256_fmadd_ps() for fused multiply-add operations
+- _mm256_i32gather_ps() for vectorized indirect memory access
+- 8 transducers processed per outer loop iteration to maximize register utilization
+
+3.3 Fast Square Root Approximation
+
+The standard sqrt() is replaced with a fast SIMD approximation using:
+- _mm256_rsqrt_ps() for initial reciprocal square root estimate
+- One Newton-Raphson iteration for improved accuracy
+- Multiplication by x to get sqrt(x) from 1/sqrt(x)
+
+This provides approximately 12-bit accuracy, sufficient for the beamforming application.
+
+3.4 Cache Blocking
+
+A blocking strategy is employed to improve cache utilization:
+- Block size: 32768 floats (128KB)
+- For each block of image points, all 1024 transducers are processed
+- This keeps the accumulator buffer in L1/L2 cache while iterating over transducers
+- Results are copied to the output array after processing all transducers for a block
+
+3.5 Loop Unrolling
+
+The inner loop processes 16 points per iteration (2 groups of 8 for AVX2), and 8 transducers are processed together. This maximizes instruction-level parallelism and hides memory latency.
+
+3.6 Memory Alignment
+
+All major data arrays are aligned to 64-byte boundaries using posix_memalign(), ensuring optimal cache line utilization and avoiding split-line penalties for SIMD loads/stores.
+
+4. RESULTS
+
+4.1 Baseline Performance
+
+The single-threaded baseline implementation (./beamform) was measured for all input sizes:
+
++--------+---------------------------+-------------+
+| Size   | Elapsed Time (usec)       | Average     |
++--------+---------------------------+-------------+
+| 16     | 1114486 / 1110232 / 1119591 | 1,114,770  |
+| 32     | 4525317 / 4530689 / 4477954 | 4,511,320  |
+| 64     | 18243189 / 18057843 / 18142451 | 18,147,828 |
++--------+---------------------------+-------------+
+
+All baseline runs verified correct with RMS error ~3.4e-17.
+
+4.2 Optimized Implementation Performance
+
+The optimized multi-threaded implementation (./beamform_mt) results:
+
+Size 16 (399,360 points):
++----------+---------------------------+-----------+---------+
+| Threads  | Elapsed Time (usec)       | Average   | Speedup |
++----------+---------------------------+-----------+---------+
+| 1        | 326390 / 336625 / 326595  | 329,870   | 3.38x   |
+| 2        | 164983 / 163410 / 165616  | 164,670   | 6.77x   |
+| 4        | 83043 / 84815 / 82705     | 83,521    | 13.35x  |
+| 8        | 44562 / 44038 / 43999     | 44,200    | 25.22x  |
+| 16       | 32965 / 32660 / 35003     | 33,543    | 33.24x  |
++----------+---------------------------+-----------+---------+
+
+Size 32 (1,597,440 points):
++----------+---------------------------+-----------+---------+
+| Threads  | Elapsed Time (usec)       | Average   | Speedup |
++----------+---------------------------+-----------+---------+
+| 1        | 1304926 / 1307447 / 1306862 | 1,306,412 | 3.45x  |
+| 2        | 652757 / 653961 / 652521  | 653,080   | 6.91x   |
+| 4        | 328891 / 329478 / 329453  | 329,274   | 13.70x  |
+| 8        | 176960 / 179964 / 186599  | 181,174   | 24.90x  |
+| 16       | 136591 / 130020 / 134087  | 133,566   | 33.78x  |
++----------+---------------------------+-----------+---------+
+
+Size 64 (6,386,560 points):
++----------+---------------------------+-----------+---------+
+| Threads  | Elapsed Time (usec)       | Average   | Speedup |
++----------+---------------------------+-----------+---------+
+| 1        | 5219019 / 5220196 / 5221181 | 5,220,132 | 3.48x  |
+| 2        | 2611592 / 2607312 / 2610038 | 2,609,647 | 6.95x  |
+| 4        | 1314364 / 1317130 / 1318113 | 1,316,536 | 13.78x |
+| 8        | 716147 / 715301 / 714327  | 715,258   | 25.37x  |
+| 16       | 533595 / 537735 / 534980  | 535,437   | 33.89x  |
++----------+---------------------------+-----------+---------+
+
+All optimized runs verified correct with RMS error ~3.3e-17.
+
+4.3 Scalability Analysis
+
+Thread Scaling Efficiency (Size 64):
++----------+-----------+------------------+------------+
+| Threads  | Time (us) | Ideal Speedup    | Efficiency |
++----------+-----------+------------------+------------+
+| 1        | 5,220,132 | 1.0x             | 100%       |
+| 2        | 2,609,647 | 2.0x (actual 2.0)| 100%       |
+| 4        | 1,316,536 | 4.0x (actual 3.97)| 99%       |
+| 8        | 715,258   | 8.0x (actual 7.30)| 91%       |
+| 16       | 535,437   | 16.0x (actual 9.75)| 61%      |
++----------+-----------+------------------+------------+
+
+The application demonstrates excellent scaling up to 8 threads (physical cores), with near-linear speedup and 91% efficiency. Beyond 8 threads, Hyper-Threading provides diminishing returns:
+
+- 1-4 threads: Near-perfect linear scaling (99-100% efficiency)
+- 8 threads: Slight efficiency loss (91%) due to shared L3 cache contention
+- 16 threads: Significant efficiency drop (61%) because Hyper-Threading shares execution resources within each core
+
+The 16-thread configuration still provides a 1.34x improvement over 8 threads, indicating Hyper-Threading provides benefit despite not doubling performance.
+
+5. PERFORMANCE ANALYSIS
+
+5.1 Speedup Breakdown
+
+The total speedup of ~34x over baseline can be decomposed as:
+
+1. SIMD Vectorization (single-threaded): 3.48x
+   - Baseline (size 64): 18,147,828 usec
+   - Optimized 1-thread: 5,220,132 usec
+   - This includes AVX2 vectorization, fast sqrt, and cache blocking
+
+2. Multi-threading Scaling: 9.75x
+   - 1-thread optimized: 5,220,132 usec
+   - 16-thread optimized: 535,437 usec
+
+3. Combined: 3.48 × 9.75 = 33.9x total speedup
+
+5.2 Scaling Observations
+
+Strong Scaling: The application shows strong scaling behavior where doubling threads approximately halves execution time up to the physical core count:
+- 1→2 threads: 2.00x speedup
+- 2→4 threads: 1.98x speedup
+- 4→8 threads: 1.84x speedup
+- 8→16 threads: 1.34x speedup
+
+The diminishing returns beyond 8 threads are expected because:
+1. Hyper-Threading shares ALUs, FPUs, and cache within each core
+2. Memory bandwidth becomes the bottleneck with 16 threads
+3. The gather operations for rx_data are memory-latency bound
+
+Weak Scaling: Execution time scales linearly with problem size:
+- Size 16→32 (4x points): ~4x time increase
+- Size 32→64 (4x points): ~4x time increase
+This confirms the O(n) complexity per transducer is maintained.
+
+5.3 Bottleneck Analysis
+
+The primary performance bottleneck is the gather operation for rx_data access. Each image point requires 1024 indirect memory accesses (one per transducer), and these accesses have irregular patterns that defeat hardware prefetching. The AVX2 gather instruction helps but is still limited by memory latency.
+
+6. CONCLUSIONS
+
+The optimized beamforming implementation achieves a 34x speedup over the baseline through a combination of multi-threading, SIMD vectorization, cache-aware blocking, and algorithmic optimizations. The implementation maintains numerical accuracy while fully utilizing the parallel capabilities of the Intel i7-11700 processor.
+
+Key learnings:
+- AVX2 gather instructions are effective but have higher latency than contiguous loads
+- Cache blocking is essential when iterating over many transducers per point
+- Processing multiple transducers together improves register utilization
+- Fast math approximations provide meaningful speedup with acceptable accuracy loss

@@ -34,16 +34,8 @@ typedef struct {
     int thread_id;
 } Task;
 
-// Fast inverse sqrt using rsqrt + Newton-Raphson
-static inline __m256 fast_sqrt_ps(__m256 x) {
-    __m256 half = _mm256_set1_ps(0.5f);
-    __m256 three = _mm256_set1_ps(3.0f);
-    __m256 rsqrt = _mm256_rsqrt_ps(x);
-    __m256 rsqrt_sq = _mm256_mul_ps(rsqrt, rsqrt);
-    __m256 tmp = _mm256_fnmadd_ps(x, rsqrt_sq, three);
-    rsqrt = _mm256_mul_ps(_mm256_mul_ps(rsqrt, tmp), half);
-    return _mm256_mul_ps(x, rsqrt);
-}
+// Use hardware sqrt for correctness (AVX-512 has fast sqrt)
+#define fast_sqrt_512(x) _mm512_sqrt_ps(x)
 
 #define BLOCK_SIZE 32768
 
@@ -74,13 +66,12 @@ static void *worker(void *arg)
     const int point_start = t->point_start;
     const int point_end = t->point_end;
 
-    const __m256 v_idx_const_inv = _mm256_set1_ps(idx_const_inv);
-    const __m256 v_filter_delay = _mm256_set1_ps((float)filter_delay + 0.5f);
-    const __m256 v_zero = _mm256_setzero_ps();
+    const __m512 v_idx_const_inv = _mm512_set1_ps(idx_const_inv);
+    const __m512 v_filter_delay = _mm512_set1_ps((float)filter_delay + 0.5f);
+    const __m512 v_zero = _mm512_setzero_ps();
 
     // Align to cache line
     float image_buffer[BLOCK_SIZE] __attribute__((aligned(64)));
-    int idx_buf[8] __attribute__((aligned(32)));
 
     for (int p_base = point_start; p_base < point_end; p_base += BLOCK_SIZE) {
         int p_limit = (p_base + BLOCK_SIZE < point_end) ? p_base + BLOCK_SIZE : point_end;
@@ -89,148 +80,153 @@ static void *worker(void *arg)
         // Zero the buffer
         memset(image_buffer, 0, block_len * sizeof(float));
 
-        // Process all transducers for this block - 8 at a time for max ILP
+        // Process all transducers for this block - 4 at a time for balance between registers and ILP
         int it_rx = 0;
-        for (; it_rx + 7 < rx_total; it_rx += 8) {
-            const __m256 v_rxx0 = _mm256_set1_ps(rx_x[it_rx]);
-            const __m256 v_rxy0 = _mm256_set1_ps(rx_y[it_rx]);
-            const __m256 v_rxx1 = _mm256_set1_ps(rx_x[it_rx + 1]);
-            const __m256 v_rxy1 = _mm256_set1_ps(rx_y[it_rx + 1]);
-            const __m256 v_rxx2 = _mm256_set1_ps(rx_x[it_rx + 2]);
-            const __m256 v_rxy2 = _mm256_set1_ps(rx_y[it_rx + 2]);
-            const __m256 v_rxx3 = _mm256_set1_ps(rx_x[it_rx + 3]);
-            const __m256 v_rxy3 = _mm256_set1_ps(rx_y[it_rx + 3]);
-            const __m256 v_rxx4 = _mm256_set1_ps(rx_x[it_rx + 4]);
-            const __m256 v_rxy4 = _mm256_set1_ps(rx_y[it_rx + 4]);
-            const __m256 v_rxx5 = _mm256_set1_ps(rx_x[it_rx + 5]);
-            const __m256 v_rxy5 = _mm256_set1_ps(rx_y[it_rx + 5]);
-            const __m256 v_rxx6 = _mm256_set1_ps(rx_x[it_rx + 6]);
-            const __m256 v_rxy6 = _mm256_set1_ps(rx_y[it_rx + 6]);
-            const __m256 v_rxx7 = _mm256_set1_ps(rx_x[it_rx + 7]);
-            const __m256 v_rxy7 = _mm256_set1_ps(rx_y[it_rx + 7]);
-            
+        for (; it_rx + 3 < rx_total; it_rx += 4) {
+            const __m512 v_rxx0 = _mm512_set1_ps(rx_x[it_rx]);
+            const __m512 v_rxy0 = _mm512_set1_ps(rx_y[it_rx]);
+            const __m512 v_rxx1 = _mm512_set1_ps(rx_x[it_rx + 1]);
+            const __m512 v_rxy1 = _mm512_set1_ps(rx_y[it_rx + 1]);
+            const __m512 v_rxx2 = _mm512_set1_ps(rx_x[it_rx + 2]);
+            const __m512 v_rxy2 = _mm512_set1_ps(rx_y[it_rx + 2]);
+            const __m512 v_rxx3 = _mm512_set1_ps(rx_x[it_rx + 3]);
+            const __m512 v_rxy3 = _mm512_set1_ps(rx_y[it_rx + 3]);
+
             const float *rx_base0 = rx_data + (size_t)it_rx * data_len;
             const float *rx_base1 = rx_data + (size_t)(it_rx + 1) * data_len;
             const float *rx_base2 = rx_data + (size_t)(it_rx + 2) * data_len;
             const float *rx_base3 = rx_data + (size_t)(it_rx + 3) * data_len;
-            const float *rx_base4 = rx_data + (size_t)(it_rx + 4) * data_len;
-            const float *rx_base5 = rx_data + (size_t)(it_rx + 5) * data_len;
-            const float *rx_base6 = rx_data + (size_t)(it_rx + 6) * data_len;
-            const float *rx_base7 = rx_data + (size_t)(it_rx + 7) * data_len;
 
             int k = 0;
-            // Main loop: 16 points at a time (2 groups of 8)
+            // Main loop: 32 points at a time (2 groups of 16)
+            for (; k + 31 < block_len; k += 32) {
+                int p = p_base + k;
+
+                // Load first 16 points
+                __m512 v_px_a = _mm512_loadu_ps(&point_x[p]);
+                __m512 v_py_a = _mm512_loadu_ps(&point_y[p]);
+                __m512 v_pz_a = _mm512_loadu_ps(&point_z[p]);
+                __m512 v_dtx_a = _mm512_loadu_ps(&dist_tx[p]);
+                __m512 v_dz_a = _mm512_sub_ps(v_zero, v_pz_a);
+                __m512 v_dz2_a = _mm512_mul_ps(v_dz_a, v_dz_a);
+
+                // Load second 16 points
+                __m512 v_px_b = _mm512_loadu_ps(&point_x[p + 16]);
+                __m512 v_py_b = _mm512_loadu_ps(&point_y[p + 16]);
+                __m512 v_pz_b = _mm512_loadu_ps(&point_z[p + 16]);
+                __m512 v_dtx_b = _mm512_loadu_ps(&dist_tx[p + 16]);
+                __m512 v_dz_b = _mm512_sub_ps(v_zero, v_pz_b);
+                __m512 v_dz2_b = _mm512_mul_ps(v_dz_b, v_dz_b);
+
+                __m512 v_acc_a = _mm512_loadu_ps(&image_buffer[k]);
+                __m512 v_acc_b = _mm512_loadu_ps(&image_buffer[k + 16]);
+
+                // Process all 4 transducers x 2 point groups
+                #define PROCESS_TX_512(N, base) \
+                { \
+                    __m512 dx_a = _mm512_sub_ps(v_rxx##N, v_px_a); \
+                    __m512 dy_a = _mm512_sub_ps(v_rxy##N, v_py_a); \
+                    __m512 sum_a = _mm512_fmadd_ps(dx_a, dx_a, _mm512_fmadd_ps(dy_a, dy_a, v_dz2_a)); \
+                    __m512 dist_a = _mm512_add_ps(v_dtx_a, fast_sqrt_512(sum_a)); \
+                    __m512i idx_a = _mm512_cvttps_epi32(_mm512_fmadd_ps(dist_a, v_idx_const_inv, v_filter_delay)); \
+                    v_acc_a = _mm512_add_ps(v_acc_a, _mm512_i32gather_ps(idx_a, base, 4)); \
+                    __m512 dx_b = _mm512_sub_ps(v_rxx##N, v_px_b); \
+                    __m512 dy_b = _mm512_sub_ps(v_rxy##N, v_py_b); \
+                    __m512 sum_b = _mm512_fmadd_ps(dx_b, dx_b, _mm512_fmadd_ps(dy_b, dy_b, v_dz2_b)); \
+                    __m512 dist_b = _mm512_add_ps(v_dtx_b, fast_sqrt_512(sum_b)); \
+                    __m512i idx_b = _mm512_cvttps_epi32(_mm512_fmadd_ps(dist_b, v_idx_const_inv, v_filter_delay)); \
+                    v_acc_b = _mm512_add_ps(v_acc_b, _mm512_i32gather_ps(idx_b, base, 4)); \
+                }
+
+                PROCESS_TX_512(0, rx_base0)
+                PROCESS_TX_512(1, rx_base1)
+                PROCESS_TX_512(2, rx_base2)
+                PROCESS_TX_512(3, rx_base3)
+                #undef PROCESS_TX_512
+
+                _mm512_storeu_ps(&image_buffer[k], v_acc_a);
+                _mm512_storeu_ps(&image_buffer[k + 16], v_acc_b);
+            }
+
+            // Handle remaining 16-point chunks
             for (; k + 15 < block_len; k += 16) {
                 int p = p_base + k;
 
-                // Load first 8 points
-                __m256 v_px_a = _mm256_loadu_ps(&point_x[p]);
-                __m256 v_py_a = _mm256_loadu_ps(&point_y[p]);
-                __m256 v_pz_a = _mm256_loadu_ps(&point_z[p]);
-                __m256 v_dtx_a = _mm256_loadu_ps(&dist_tx[p]);
-                __m256 v_dz_a = _mm256_sub_ps(v_zero, v_pz_a);
-                __m256 v_dz2_a = _mm256_mul_ps(v_dz_a, v_dz_a);
+                __m512 v_px = _mm512_loadu_ps(&point_x[p]);
+                __m512 v_py = _mm512_loadu_ps(&point_y[p]);
+                __m512 v_pz = _mm512_loadu_ps(&point_z[p]);
+                __m512 v_dtx = _mm512_loadu_ps(&dist_tx[p]);
+                __m512 v_dz = _mm512_sub_ps(v_zero, v_pz);
+                __m512 v_dz2 = _mm512_mul_ps(v_dz, v_dz);
 
-                // Load second 8 points
-                __m256 v_px_b = _mm256_loadu_ps(&point_x[p + 8]);
-                __m256 v_py_b = _mm256_loadu_ps(&point_y[p + 8]);
-                __m256 v_pz_b = _mm256_loadu_ps(&point_z[p + 8]);
-                __m256 v_dtx_b = _mm256_loadu_ps(&dist_tx[p + 8]);
-                __m256 v_dz_b = _mm256_sub_ps(v_zero, v_pz_b);
-                __m256 v_dz2_b = _mm256_mul_ps(v_dz_b, v_dz_b);
+                #define COMPUTE_TX_512(N) \
+                    __m512 v_dx##N = _mm512_sub_ps(v_rxx##N, v_px); \
+                    __m512 v_dy##N = _mm512_sub_ps(v_rxy##N, v_py); \
+                    __m512 v_sum##N = _mm512_fmadd_ps(v_dx##N, v_dx##N, _mm512_fmadd_ps(v_dy##N, v_dy##N, v_dz2)); \
+                    __m512 v_dist##N = _mm512_add_ps(v_dtx, fast_sqrt_512(v_sum##N)); \
+                    __m512i v_idx##N = _mm512_cvttps_epi32(_mm512_fmadd_ps(v_dist##N, v_idx_const_inv, v_filter_delay));
 
-                __m256 v_acc_a = _mm256_loadu_ps(&image_buffer[k]);
-                __m256 v_acc_b = _mm256_loadu_ps(&image_buffer[k + 8]);
+                COMPUTE_TX_512(0)
+                COMPUTE_TX_512(1)
+                COMPUTE_TX_512(2)
+                COMPUTE_TX_512(3)
+                #undef COMPUTE_TX_512
 
-                // Process all 8 transducers x 2 point groups
-                #define PROCESS_TX(N, base) \
-                { \
-                    __m256 dx_a = _mm256_sub_ps(v_rxx##N, v_px_a); \
-                    __m256 dy_a = _mm256_sub_ps(v_rxy##N, v_py_a); \
-                    __m256 sum_a = _mm256_fmadd_ps(dx_a, dx_a, _mm256_fmadd_ps(dy_a, dy_a, v_dz2_a)); \
-                    __m256 dist_a = _mm256_add_ps(v_dtx_a, fast_sqrt_ps(sum_a)); \
-                    __m256i idx_a = _mm256_cvttps_epi32(_mm256_fmadd_ps(dist_a, v_idx_const_inv, v_filter_delay)); \
-                    v_acc_a = _mm256_add_ps(v_acc_a, _mm256_i32gather_ps(base, idx_a, 4)); \
-                    __m256 dx_b = _mm256_sub_ps(v_rxx##N, v_px_b); \
-                    __m256 dy_b = _mm256_sub_ps(v_rxy##N, v_py_b); \
-                    __m256 sum_b = _mm256_fmadd_ps(dx_b, dx_b, _mm256_fmadd_ps(dy_b, dy_b, v_dz2_b)); \
-                    __m256 dist_b = _mm256_add_ps(v_dtx_b, fast_sqrt_ps(sum_b)); \
-                    __m256i idx_b = _mm256_cvttps_epi32(_mm256_fmadd_ps(dist_b, v_idx_const_inv, v_filter_delay)); \
-                    v_acc_b = _mm256_add_ps(v_acc_b, _mm256_i32gather_ps(base, idx_b, 4)); \
-                }
+                __m512 v_data0 = _mm512_i32gather_ps(v_idx0, rx_base0, 4);
+                __m512 v_data1 = _mm512_i32gather_ps(v_idx1, rx_base1, 4);
+                __m512 v_data2 = _mm512_i32gather_ps(v_idx2, rx_base2, 4);
+                __m512 v_data3 = _mm512_i32gather_ps(v_idx3, rx_base3, 4);
 
-                PROCESS_TX(0, rx_base0) PROCESS_TX(1, rx_base1)
-                PROCESS_TX(2, rx_base2) PROCESS_TX(3, rx_base3)
-                PROCESS_TX(4, rx_base4) PROCESS_TX(5, rx_base5)
-                PROCESS_TX(6, rx_base6) PROCESS_TX(7, rx_base7)
-                #undef PROCESS_TX
-
-                _mm256_storeu_ps(&image_buffer[k], v_acc_a);
-                _mm256_storeu_ps(&image_buffer[k + 8], v_acc_b);
-            }
-
-            // Handle remaining 8-point chunks
-            for (; k + 7 < block_len; k += 8) {
-                int p = p_base + k;
-
-                __m256 v_px = _mm256_loadu_ps(&point_x[p]);
-                __m256 v_py = _mm256_loadu_ps(&point_y[p]);
-                __m256 v_pz = _mm256_loadu_ps(&point_z[p]);
-                __m256 v_dtx = _mm256_loadu_ps(&dist_tx[p]);
-                __m256 v_dz = _mm256_sub_ps(v_zero, v_pz);
-                __m256 v_dz2 = _mm256_mul_ps(v_dz, v_dz);
-
-                #define COMPUTE_TX(N) \
-                    __m256 v_dx##N = _mm256_sub_ps(v_rxx##N, v_px); \
-                    __m256 v_dy##N = _mm256_sub_ps(v_rxy##N, v_py); \
-                    __m256 v_sum##N = _mm256_fmadd_ps(v_dx##N, v_dx##N, _mm256_fmadd_ps(v_dy##N, v_dy##N, v_dz2)); \
-                    __m256 v_dist##N = _mm256_add_ps(v_dtx, fast_sqrt_ps(v_sum##N)); \
-                    __m256i v_idx##N = _mm256_cvttps_epi32(_mm256_fmadd_ps(v_dist##N, v_idx_const_inv, v_filter_delay));
-
-                COMPUTE_TX(0) COMPUTE_TX(1) COMPUTE_TX(2) COMPUTE_TX(3)
-                COMPUTE_TX(4) COMPUTE_TX(5) COMPUTE_TX(6) COMPUTE_TX(7)
-                #undef COMPUTE_TX
-
-                __m256 v_data0 = _mm256_i32gather_ps(rx_base0, v_idx0, 4);
-                __m256 v_data1 = _mm256_i32gather_ps(rx_base1, v_idx1, 4);
-                __m256 v_data2 = _mm256_i32gather_ps(rx_base2, v_idx2, 4);
-                __m256 v_data3 = _mm256_i32gather_ps(rx_base3, v_idx3, 4);
-                __m256 v_data4 = _mm256_i32gather_ps(rx_base4, v_idx4, 4);
-                __m256 v_data5 = _mm256_i32gather_ps(rx_base5, v_idx5, 4);
-                __m256 v_data6 = _mm256_i32gather_ps(rx_base6, v_idx6, 4);
-                __m256 v_data7 = _mm256_i32gather_ps(rx_base7, v_idx7, 4);
-
-                __m256 v_acc = _mm256_loadu_ps(&image_buffer[k]);
-                v_acc = _mm256_add_ps(v_acc, _mm256_add_ps(v_data0, v_data1));
-                v_acc = _mm256_add_ps(v_acc, _mm256_add_ps(v_data2, v_data3));
-                v_acc = _mm256_add_ps(v_acc, _mm256_add_ps(v_data4, v_data5));
-                v_acc = _mm256_add_ps(v_acc, _mm256_add_ps(v_data6, v_data7));
-                _mm256_storeu_ps(&image_buffer[k], v_acc);
+                __m512 v_acc = _mm512_loadu_ps(&image_buffer[k]);
+                v_acc = _mm512_add_ps(v_acc, _mm512_add_ps(v_data0, v_data1));
+                v_acc = _mm512_add_ps(v_acc, _mm512_add_ps(v_data2, v_data3));
+                _mm512_storeu_ps(&image_buffer[k], v_acc);
             }
         }
 
-        // Handle remaining transducers (< 8)
+        // Handle remaining transducers (< 4)
         for (; it_rx < rx_total; ++it_rx) {
-            const __m256 v_rxx = _mm256_set1_ps(rx_x[it_rx]);
-            const __m256 v_rxy = _mm256_set1_ps(rx_y[it_rx]);
+            const __m512 v_rxx = _mm512_set1_ps(rx_x[it_rx]);
+            const __m512 v_rxy = _mm512_set1_ps(rx_y[it_rx]);
             const float *rx_base = rx_data + (size_t)it_rx * data_len;
 
-            for (int k = 0; k + 7 < block_len; k += 8) {
+            for (int k = 0; k + 15 < block_len; k += 16) {
                 int p = p_base + k;
-                __m256 v_px = _mm256_loadu_ps(&point_x[p]);
-                __m256 v_py = _mm256_loadu_ps(&point_y[p]);
-                __m256 v_pz = _mm256_loadu_ps(&point_z[p]);
-                __m256 v_dtx = _mm256_loadu_ps(&dist_tx[p]);
-                __m256 v_dx = _mm256_sub_ps(v_rxx, v_px);
-                __m256 v_dy = _mm256_sub_ps(v_rxy, v_py);
-                __m256 v_dz = _mm256_sub_ps(v_zero, v_pz);
-                __m256 v_sum = _mm256_fmadd_ps(v_dx, v_dx, _mm256_fmadd_ps(v_dy, v_dy, _mm256_mul_ps(v_dz, v_dz)));
-                __m256 v_dist = _mm256_add_ps(v_dtx, fast_sqrt_ps(v_sum));
-                __m256i v_idx = _mm256_cvttps_epi32(_mm256_fmadd_ps(v_dist, v_idx_const_inv, v_filter_delay));
-                __m256 v_data = _mm256_i32gather_ps(rx_base, v_idx, 4);
-                __m256 v_acc = _mm256_loadu_ps(&image_buffer[k]);
-                _mm256_storeu_ps(&image_buffer[k], _mm256_add_ps(v_acc, v_data));
+                __m512 v_px = _mm512_loadu_ps(&point_x[p]);
+                __m512 v_py = _mm512_loadu_ps(&point_y[p]);
+                __m512 v_pz = _mm512_loadu_ps(&point_z[p]);
+                __m512 v_dtx = _mm512_loadu_ps(&dist_tx[p]);
+                __m512 v_dx = _mm512_sub_ps(v_rxx, v_px);
+                __m512 v_dy = _mm512_sub_ps(v_rxy, v_py);
+                __m512 v_dz = _mm512_sub_ps(v_zero, v_pz);
+                __m512 v_sum = _mm512_fmadd_ps(v_dx, v_dx, _mm512_fmadd_ps(v_dy, v_dy, _mm512_mul_ps(v_dz, v_dz)));
+                __m512 v_dist = _mm512_add_ps(v_dtx, fast_sqrt_512(v_sum));
+                __m512i v_idx = _mm512_cvttps_epi32(_mm512_fmadd_ps(v_dist, v_idx_const_inv, v_filter_delay));
+                __m512 v_data = _mm512_i32gather_ps(v_idx, rx_base, 4);
+                __m512 v_acc = _mm512_loadu_ps(&image_buffer[k]);
+                _mm512_storeu_ps(&image_buffer[k], _mm512_add_ps(v_acc, v_data));
             }
+        }
+
+        // Handle remaining points that don't fit in 16-element vectors (scalar fallback)
+        int remaining_start = (block_len / 16) * 16;
+        for (int k = remaining_start; k < block_len; ++k) {
+            int p = p_base + k;
+            float acc = 0.0f;
+            float px = point_x[p];
+            float py = point_y[p];
+            float pz = point_z[p];
+            float dtx = dist_tx[p];
+            
+            for (int rx = 0; rx < rx_total; ++rx) {
+                float dx = rx_x[rx] - px;
+                float dy = rx_y[rx] - py;
+                float dz = 0.0f - pz;
+                float dist = dtx + sqrtf(dx * dx + dy * dy + dz * dz);
+                int idx = (int)(dist * idx_const_inv + (float)filter_delay + 0.5f);
+                acc += rx_data[(size_t)rx * data_len + idx];
+            }
+            image_buffer[k] = acc;
         }
 
         memcpy(&image[p_base], image_buffer, block_len * sizeof(float));
@@ -321,9 +317,24 @@ int main(int argc, char **argv)
     const float tx_y = 0.0f;
     const float tx_z = -0.001f;
 
-    // Vectorized dist_tx computation
-    #pragma omp simd
-    for (int p = 0; p < total_pts; ++p) {
+    // Vectorized dist_tx computation with AVX-512
+    int p = 0;
+    __m512 v_tx_x = _mm512_set1_ps(tx_x);
+    __m512 v_tx_y = _mm512_set1_ps(tx_y);
+    __m512 v_tx_z = _mm512_set1_ps(tx_z);
+    for (; p + 15 < total_pts; p += 16) {
+        __m512 v_px = _mm512_loadu_ps(&point_x[p]);
+        __m512 v_py = _mm512_loadu_ps(&point_y[p]);
+        __m512 v_pz = _mm512_loadu_ps(&point_z[p]);
+        __m512 v_dx = _mm512_sub_ps(v_tx_x, v_px);
+        __m512 v_dy = _mm512_sub_ps(v_tx_y, v_py);
+        __m512 v_dz = _mm512_sub_ps(v_tx_z, v_pz);
+        __m512 v_sum = _mm512_fmadd_ps(v_dx, v_dx, _mm512_fmadd_ps(v_dy, v_dy, _mm512_mul_ps(v_dz, v_dz)));
+        __m512 v_dist = _mm512_sqrt_ps(v_sum);
+        _mm512_storeu_ps(&dist_tx[p], v_dist);
+    }
+    // Scalar fallback for remaining
+    for (; p < total_pts; ++p) {
         float dx = tx_x - point_x[p];
         float dy = tx_y - point_y[p];
         float dz = tx_z - point_z[p];

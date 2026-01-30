@@ -1,0 +1,147 @@
+================================================================================
+                    AVX-512 BEAMFORMING OPTIMIZATION REPORT
+================================================================================
+
+Author: Li Huan
+Date: January 30, 2026
+Assignment: ECE1755 Assignment 1 - Parallel Programming
+
+================================================================================
+1. OVERVIEW
+================================================================================
+
+This report documents the AVX-512 optimized implementation of the 3D ultrasound
+beamforming algorithm. The implementation builds upon the AVX2 multi-threaded
+version (beamform_mt.c) and leverages AVX-512 SIMD instructions available on
+the 11th Gen Intel Core i7-11700 processor.
+
+================================================================================
+2. HARDWARE SPECIFICATIONS
+================================================================================
+
+CPU: 11th Gen Intel(R) Core(TM) i7-11700 @ 2.50GHz
+Supported SIMD Extensions:
+  - SSE, SSE2, SSE3, SSSE3, SSE4.1, SSE4.2
+  - AVX, AVX2
+  - AVX-512F, AVX-512DQ, AVX-512CD, AVX-512BW, AVX-512VL
+  - AVX-512IFMA, AVX-512VBMI, AVX-512VBMI2, AVX-512VNNI
+  - AVX-512BITALG, AVX-512VPOPCNTDQ
+  - FMA
+
+================================================================================
+3. OPTIMIZATION TECHNIQUES
+================================================================================
+
+3.1 AVX-512 Vector Width (512-bit / 16 floats)
+----------------------------------------------
+- Changed from __m256 (8 floats) to __m512 (16 floats) vectors
+- Processes 2x more data points per SIMD instruction
+- Uses _mm512_* intrinsics throughout
+
+3.2 Key AVX-512 Instructions Used
+---------------------------------
+- _mm512_loadu_ps / _mm512_storeu_ps: 16-wide float load/store
+- _mm512_fmadd_ps: Fused multiply-add for dx*dx + dy*dy + dz*dz
+- _mm512_sqrt_ps: Hardware square root (accurate, fast on modern CPUs)
+- _mm512_i32gather_ps: 16-element gather for rx_data lookups
+- _mm512_cvttps_epi32: Float to int conversion for index calculation
+
+3.3 Loop Structure Optimization
+-------------------------------
+- Main loop processes 32 points at a time (2 groups of 16)
+- 4-way transducer unrolling (balanced for AVX-512 register pressure)
+- Reduced from 8-way unrolling in AVX2 due to wider registers
+- Block-based processing (BLOCK_SIZE = 32768) for cache efficiency
+
+3.4 Memory Access Optimization
+------------------------------
+- 64-byte aligned memory allocation (matches AVX-512 vector width)
+- Contiguous memory access patterns for point data
+- Gather instructions for non-contiguous rx_data access
+- Thread-local image buffers to avoid false sharing
+
+3.5 Thread Affinity
+-------------------
+- CPU pinning via pthread_setaffinity_np
+- Reduces thread migration overhead
+
+================================================================================
+4. PERFORMANCE RESULTS
+================================================================================
+
+Test Configuration: Input Size 16, 8 Threads
+
++------------------+---------------+-------------------+
+| Version          | Time (usec)   | Speedup vs Base   |
++------------------+---------------+-------------------+
+| Baseline         | 1,117,800     | 1.0x              |
+| AVX2 (8 threads) |    44,862     | 24.9x             |
+| AVX-512 (8 thr)  |    22,925     | 48.8x             |
++------------------+---------------+-------------------+
+
+AVX-512 Improvement over AVX2: ~1.96x (nearly 2x)
+
+Test Configuration: Input Size 16, 4 Threads
+
++------------------+---------------+-------------------+
+| Version          | Time (usec)   | Speedup vs Base   |
++------------------+---------------+-------------------+
+| Baseline         | 1,109,541     | 1.0x              |
+| AVX2 (4 threads) |    83,103     | 13.4x             |
+| AVX-512 (4 thr)  |    43,168     | 25.7x             |
++------------------+---------------+-------------------+
+
+AVX-512 Improvement over AVX2: ~1.93x
+
+================================================================================
+5. CORRECTNESS VERIFICATION
+================================================================================
+
+Output verified against reference solution:
+- RMS Error: 3.616845e-17 (essentially zero for single-precision floats)
+- Maximum absolute difference: 8.531316e-16 at index 282562
+- Result: PASS
+
+The minor floating-point differences are due to different operation ordering
+in SIMD computations, which is expected and acceptable.
+
+================================================================================
+6. COMPILATION
+================================================================================
+
+Compiler: GCC 12.2.0 (Debian)
+
+Compilation command:
+  gcc beamform_mt_512.c -o beamform_mt_512 -lm -O3 -march=native \
+      -ffast-math -funroll-loops -lpthread
+
+The -march=native flag automatically enables all supported AVX-512 extensions.
+
+================================================================================
+7. FILES MODIFIED/ADDED
+================================================================================
+
+New Files:
+  - beamform_mt_512.c    : AVX-512 optimized implementation
+  - report_512.txt       : This report
+
+Modified Files:
+  - Makefile             : Added beamform_mt_512 build target
+  - run_benchmarks.sh    : Added AVX-512 benchmark section
+
+================================================================================
+8. CONCLUSIONS
+================================================================================
+
+The AVX-512 implementation achieves approximately 2x speedup over the AVX2
+version, which is expected given the 2x wider SIMD vectors (512-bit vs 256-bit).
+Combined with multi-threading, the total speedup reaches nearly 50x compared
+to the sequential baseline implementation.
+
+Key factors contributing to performance:
+1. 16-wide SIMD operations vs 8-wide in AVX2
+2. Efficient use of AVX-512 gather instructions for random access
+3. FMA instructions for compute-intensive distance calculations
+4. Optimized loop structure balancing ILP and register pressure
+
+================================================================================

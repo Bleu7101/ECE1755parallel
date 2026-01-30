@@ -32,5 +32,21 @@ done
 
 echo ""
 echo "=========================================="
+echo "AVX-512 BEAMFORM_MT_512 BENCHMARKS"
+echo "=========================================="
+
+for size in 16 32 64; do
+    for threads in 1 2 4 8 16; do
+        echo ""
+        echo "--- beamform_mt_512 $threads threads, Size $size ---"
+        ./beamform_mt_512 $threads $size 2>&1 | grep "Elapsed"
+        ./beamform_mt_512 $threads $size 2>&1 | grep "Elapsed"
+        ./beamform_mt_512 $threads $size 2>&1 | grep "Elapsed"
+        ./solution_check $size
+    done
+done
+
+echo ""
+echo "=========================================="
 echo "BENCHMARKS COMPLETE"
 echo "=========================================="

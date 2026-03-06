@@ -1,0 +1,190 @@
+### (a) Protocol Description and Verification Approach
+
+#### Protocol Description
+The baseline protocol is a standard directory-based MSI (Modified, Shared, Invalid) cache coherence protocol. Operations are carried out over a fully interconnected, unordered point-to-point network. Because the network may reorder or delay messages, the protocol employs point-to-point acknowledgments and transient states to resolve race conditions and enforce a Single-Writer, Multiple-Reader (SWMR) invariant. 
+
+**Key Mechanisms:**
+1.  **Stable and Transient States:** The processor features three stable states (`I`, `S`, `M`). Because directory responses and cache evictions aren't instantaneous, five transient states (`PI_S`, `PI_M`, `PS_M`, `PS_I`, `PM_I`) are introduced. These "pending" states buffer incoming invalidations and track expected acknowledgment counts until a targeted upgrade or downgrade fully completes.
+2.  **3-Hop Forwarding:** The home/directory node never actively issues unsolicited messages. Instead, it mediates transactions. On read/write misses (`GetS`, `GetM`), it tracks the exclusive owner using a directory structure and forwards the requesting messages directly to the owner (`Fwd_GetS`, `Fwd_GetM`). The owner then sends the data directly to the requester, thus keeping the maximum transaction latency strictly capped at three network hops (Requester -> Directory -> Owner -> Requester).
+3.  **Virtual Channels (Deadlock Avoidance):** Since receive mailbox buffers might block, the protocol classifies messages into three ranked Virtual Channels (VCs) to prevent cyclic dependence deadlocks:
+    *   **VC0 (Requests):** `GetS`, `GetM`, `PutS`, `PutM`. 
+    *   **VC1 (Forwarded Controls):** `Fwd_GetS`, `Fwd_GetM`, `Inv`.
+    *   **VC2 (Data and Acknowledgments):** `Data`, `InvAck`, `PutAck`.
+
+#### Verification Approach
+Formal verification was conducted using **Murphi 3.1**, a state-space enumeration model checker. The model explicitly describes the asynchronous nature of the interconnect by representing it as an array-based multiset queue for each node, thoroughly vetting all possible interleavings of inflight messages.
+
+**Strategy:**
+1.  **State Space Constraints:** To verify exhaustive correctness without exceeding hardware memory bounds, the constants were scaled using `ProcCount: 2`, `ValueCount: 1`, and a tightened network buffer dimension (`NetMax: 5`). 
+2.  **Safety Invariants:** We defined multiple strict invariant checks to ensure the protocol works perfectly across all permutations:
+    *   *Modified/Owner Mutual Exclusion:* Ensures that if any processor holds an address in state `M`, no other processor can simultaneously hold it in `M` or `S`. 
+    *   *Invalidation Coherence:* Ensures that a node waiting in a transient state does correctly unroll its local data cache if it receives a forwarded invalidation sequentially prior to its promised data fetch.
+    *   *Unexpected Message Detection:* The verification sweeps caught out-of-bounds message queue exceptions and verified correct silent message drops when delayed, stale acknowledgments reached a node that had already evicted.
+
+---
+
+### (b) Baseline Cache State Machine Diagram
+
+Below is the diagram documenting the baseline processor cache states.
+(Note: You can paste the code below into a Mermaid Live Editor to view the graph)
+
+```mermaid
+stateDiagram-v2
+    %% Stable States
+    state "P_I (Invalid)" as P_I
+    state "P_S (Shared)" as P_S
+    state "P_M (Modified)" as P_M
+    
+    %% Transient States
+    state "PI_S (Pending I->S)" as PI_S
+    state "PI_M (Pending I->M)" as PI_M
+    state "PS_M (Pending S->M)" as PS_M
+    state "PM_I (Pending M->I)" as PM_I
+    state "PS_I (Pending S->I)" as PS_I
+
+    %% P_I Transitions
+    P_I --> PI_S : Processor Load\n[send GetS]
+    P_I --> PI_M : Processor Store\n[send GetM]
+
+    %% P_S Transitions
+    P_S --> PS_M : Processor Store\n[send GetM]
+    P_S --> PS_I : Processor Evict\n[send PutS]
+    P_S --> P_I : rcv Inv\n[send InvAck]
+    
+    %% P_M Transitions
+    P_M --> PM_I : Processor Evict\n[send PutM]
+    P_M --> P_S : rcv Fwd_GetS\n[send Data to Req & Dir]
+    P_M --> P_I : rcv Fwd_GetM\n[send Data to Req]
+
+    %% Resolving Transients -> Stable
+    PI_S --> P_S : rcv Data
+    
+    PI_M --> P_M : rcv Data (if acks_rcvd == needed)
+    PI_M --> PI_M : rcv InvAck\n[acks_rcvd++]
+    
+    PS_M --> P_M : rcv Data (if acks_rcvd == needed)
+    PS_M --> PS_M : rcv InvAck\n[acks_rcvd++]
+    
+    PS_I --> P_I : rcv PutAck
+    PM_I --> P_I : rcv PutAck
+
+    %% Edge Cases / Interleaved messages during transients
+    PI_S --> PI_S : rcv Inv\n[send InvAck, clear data buffer]
+    PS_M --> PS_M : rcv Inv\n[send InvAck, update base state->PI_M]
+```
+
+---
+
+### Appended Report: Optimized Protocol (`protocol_opt.m`)
+
+#### (a) Description of Protocol, Optimization, and Verification Approach
+
+This section appends the optimized design and does not replace the baseline writeup above.
+
+The optimized protocol keeps the baseline directory MSI behavior (`I/S/M` with transient states) and adds a speculative two-hop read path:
+
+1. Each cache records a `speculated_owner` when it receives an `Inv` from the requester of `M` ownership.
+2. If that cache later performs a load while in `P_I`, it can send `GetS_Spec` directly to the remembered owner on `VC3`.
+3. If the owner is still in `P_M`, it sends data directly (2-hop completion), then sends a metadata update `SpecOwnerToS` to Home so the directory transitions from `H_M` to `H_S` with correct sharers.
+4. If speculation is wrong (owner no longer in `P_M` or is in transient/non-owner state), receiver returns `Spec_Fail`, and requester falls back to baseline request (`GetS`/`GetM`) to Home.
+
+Key robustness choices used to pass verification:
+
+- Added `VC3` for speculative traffic (`GetS_Spec`, `GetM_Spec`, `Spec_Fail`) so it does not block normal reply ordering.
+- Added explicit `Spec_Fail` handling in non-owner/transient cache states to avoid mailbox deadlock caused by leaving speculative messages unprocessed.
+- Added `SpecOwnerToS` handling in Home so speculative success does not leave stale owner metadata.
+- Kept speculative stores disabled at rule-entry level to avoid write/write speculative races while preserving a valid optimization path.
+
+Verification approach:
+
+- Murphi BFS with symmetry (`protocol_opt`).
+- Safety checked via invariants already encoded in the model (single-writer, value tracking, owner/sharer consistency).
+- Deadlock debugging used `-tv` traces; fixes were re-verified until `No error found`.
+
+#### (b) Complete State-Machine Diagram of the Proposal
+
+Below is a complete proposal diagram in Mermaid (processor + home states, including speculative path).
+
+```mermaid
+flowchart TD
+    subgraph PROC[Processor Controller]
+        PI[P_I]
+        PS[P_S]
+        PM[P_M]
+        PIS[PI_S]
+        PIM[PI_M]
+        PSM[PS_M]
+        PMI[PM_I]
+        PMIS[PM_IS]
+        PMIM[PM_IM]
+        PSI[PS_I]
+        PISPEC[PI_S_Spec]
+        PIMSPEC[PI_M_Spec]
+        PSMSPEC[PS_M_Spec]
+
+        PI -->|load/GetS| PIS
+        PI -->|store/GetM| PIM
+        PI -->|spec load/GetS_Spec if speculated_owner| PISPEC
+
+        PIS -->|Data| PS
+        PISPEC -->|Data (from old owner)| PS
+        PISPEC -->|Spec_Fail then send GetS| PIS
+
+        PS -->|store/GetM| PSM
+        PS -->|evict/PutS| PSI
+        PS -->|Inv -> InvAck| PI
+
+        PSM -->|Data + enough InvAck| PM
+
+        PM -->|evict/PutM| PMI
+        PM -->|Fwd_GetS: send Data+FwdAck| PS
+        PM -->|Fwd_GetM: send Data+FwdAck| PI
+        PM -->|GetS_Spec: send Data + SpecOwnerToS(Home)| PS
+        PM -->|GetM_Spec: send Data| PI
+
+        PMI -->|PutAck| PI
+        PMIS -->|PutAck| PI
+        PMIM -->|PutAck| PI
+        PSI -->|PutAck| PI
+
+        PIMSPEC -->|Data| PM
+        PIMSPEC -->|Spec_Fail then GetM| PIM
+        PSMSPEC -->|Data| PM
+        PSMSPEC -->|Spec_Fail then GetM| PSM
+    end
+
+    subgraph HOME[Home/Directory Controller]
+        HI[H_I]
+        HS[H_S]
+        HM[H_M]
+        HMS[H_MS]
+        HMM[H_MM]
+
+        HI -->|GetS| HS
+        HI -->|GetM| HM
+
+        HS -->|GetM + invalidate sharers| HM
+        HS -->|last sharer PutS| HI
+
+        HM -->|GetS -> Fwd_GetS(owner)| HMS
+        HM -->|GetM -> Fwd_GetM(owner)| HMM
+        HM -->|owner PutM| HI
+        HM -->|SpecOwnerToS| HS
+
+        HMS -->|FwdAck| HS
+        HMM -->|FwdAck| HM
+    end
+```
+
+#### Comparison: Baseline vs Optimized
+
+Results from `output.txt` (baseline) and regenerated `output_opt.txt` (optimized):
+
+- Baseline `protocol`: `No error found`, `1574 states`, `3769 rules fired`.
+- Optimized `protocol_opt`: `No error found`, `7877 states`, `19252 rules fired`.
+
+Interpretation:
+
+- The optimized model explores a larger state space because speculative messages/states increase interleavings.
+- Functional correctness remains preserved (`No error found` for both).
+- Optimization target is latency/hops for successful speculative reads (2-hop path), not reduction in verification state-space size.

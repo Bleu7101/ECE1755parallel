@@ -1,4 +1,7 @@
 ----------------------------------------------------------------------
+-- Speculative MSI Protocol - Optimized Version
+-- Includes speculative access optimization to reduce hop counts
+----------------------------------------------------------------------
 -- Constants
 ----------------------------------------------------------------------
 const
@@ -7,8 +10,9 @@ const
   VC0: 0;                -- requests
   VC1: 1;                -- forwarded control / invalidations
   VC2: 2;                -- data / acknowledgements
-  NumVCs: VC2 - VC0 + 1;
-  NetMax: 12;
+  VC3: 3;                -- speculative requests/responses
+  NumVCs: VC3 - VC0 + 1;
+  NetMax: 7;
 
 ----------------------------------------------------------------------
 -- Types
@@ -27,20 +31,25 @@ type
     GetM,
     PutM,
     PutS,
+    
+    -- Speculative requests
+    GetS_Spec,
+    GetM_Spec,
+    SpecOwnerToS,
 
     -- Forwarded / control
     Fwd_GetS,
     Fwd_GetM,
     Inv,
-    SpecGetS,
 
     -- Responses
     Data,
     InvAck,
     PutAck,
     FwdAck,
-    SpecNack,
-    SpecData
+    
+    -- Speculative responses
+    Spec_Fail
   };
 
   Message:
@@ -76,12 +85,16 @@ type
         PM_I,
         PM_IS,
         PM_IM,
-        PS_I
+        PS_I,
+        -- Speculative states
+        PI_S_Spec,
+        PI_M_Spec,
+        PS_M_Spec
       };
       val: Value;
       acks_needed: 0..NetMax;
       acks_received: 0..NetMax;
-      owner_hint: Node;
+      speculated_owner: Node;
     End;
 
 ----------------------------------------------------------------------
@@ -120,7 +133,7 @@ End;
 Procedure ErrorUnhandledMsg(msg:Message; n:Node);
 Begin
   switch msg.mtype
-  case GetS, GetM, PutM, PutS, Fwd_GetS, Fwd_GetM, Inv, SpecGetS:
+  case GetS, GetM, PutM, PutS, Fwd_GetS, Fwd_GetM, Inv, GetS_Spec, GetM_Spec:
     msg_processed := false;
   else
     error "Unhandled message type!";
@@ -198,6 +211,9 @@ Begin
     case PutS:
       Send(PutAck, msg.src, HomeType, VC2, UNDEFINED, 0, UNDEFINED);
 
+    case SpecOwnerToS:
+      -- stale speculative metadata update
+
     else
       ErrorUnhandledMsg(msg, HomeType);
     endswitch;
@@ -237,6 +253,9 @@ Begin
         endif;
         Send(PutAck, msg.src, HomeType, VC2, UNDEFINED, 0, UNDEFINED);
 
+      case SpecOwnerToS:
+        -- stale speculative metadata update
+
       else
         ErrorUnhandledMsg(msg, HomeType);
       endswitch;
@@ -244,6 +263,16 @@ Begin
 
   case H_M:
     switch msg.mtype
+    case SpecOwnerToS:
+      if msg.src = HomeNode.owner
+      then
+        HomeNode.val := msg.val;
+        AddToSharersList(msg.src);
+        AddToSharersList(msg.fwd_to);
+        undefine HomeNode.owner;
+        HomeNode.state := H_S;
+      endif;
+
     case GetS:
       Assert (!IsUndefined(HomeNode.owner)) "H_M with undefined owner";
       Send(Fwd_GetS, HomeNode.owner, HomeType, VC1, UNDEFINED, 0, msg.src);
@@ -297,6 +326,9 @@ Begin
     case GetS, GetM:
       msg_processed := false;
 
+    case SpecOwnerToS:
+      -- stale speculative metadata update while waiting for forward ack
+
     else
       ErrorUnhandledMsg(msg, HomeType);
     endswitch;
@@ -321,6 +353,9 @@ Begin
     case GetS, GetM:
       msg_processed := false;
 
+    case SpecOwnerToS:
+      -- stale speculative metadata update while waiting for forward ack
+
     else
       ErrorUnhandledMsg(msg, HomeType);
     endswitch;
@@ -342,20 +377,19 @@ Begin
   alias pv:Procs[p].val do
   alias pack:Procs[p].acks_needed do
   alias prack:Procs[p].acks_received do
-  alias phint:Procs[p].owner_hint do
+  alias spec_owner:Procs[p].speculated_owner do
 
   switch ps
   case P_I:
     switch msg.mtype
     case Inv:
-      phint := msg.src;
       Send(InvAck, msg.src, p, VC2, UNDEFINED, 0, UNDEFINED);
-      undefine pv;
+      spec_owner := msg.src;
 
-    case SpecGetS:
-      Send(SpecNack, msg.src, p, VC2, UNDEFINED, 0, UNDEFINED);
+    case GetS_Spec, GetM_Spec:
+      Send(Spec_Fail, msg.src, p, VC3, UNDEFINED, 0, UNDEFINED);
 
-    case Data, InvAck, PutAck, FwdAck, SpecNack, SpecData:
+    case Data, InvAck, PutAck, FwdAck, Spec_Fail:
       -- stale response while already invalid
     else
       ErrorUnhandledMsg(msg, p);
@@ -364,15 +398,15 @@ Begin
   case P_S:
     switch msg.mtype
     case Inv:
-      phint := msg.src;
       Send(InvAck, msg.src, p, VC2, UNDEFINED, 0, UNDEFINED);
       undefine pv;
       ps := P_I;
+      spec_owner := msg.src;
 
-    case SpecGetS:
-      Send(SpecNack, msg.src, p, VC2, UNDEFINED, 0, UNDEFINED);
+    case GetS_Spec, GetM_Spec:
+      Send(Spec_Fail, msg.src, p, VC3, UNDEFINED, 0, UNDEFINED);
 
-    case Data, InvAck, PutAck, FwdAck, SpecNack, SpecData:
+    case Data, InvAck, PutAck, FwdAck, Spec_Fail:
       -- stale response
 
     else
@@ -389,14 +423,20 @@ Begin
     case Fwd_GetM:
       Send(Data, msg.fwd_to, p, VC2, pv, 0, UNDEFINED);
       Send(FwdAck, HomeType, p, VC2, UNDEFINED, 0, UNDEFINED);
-      phint := msg.fwd_to;
       undefine pv;
       ps := P_I;
 
-    case SpecGetS:
-      Send(SpecData, msg.src, p, VC2, pv, 0, UNDEFINED);
+    case GetS_Spec:
+      Send(Data, msg.src, p, VC3, pv, 0, UNDEFINED);
+      Send(SpecOwnerToS, HomeType, p, VC1, pv, 0, msg.src);
+      ps := P_S;
 
-    case Data, InvAck, PutAck, SpecNack, SpecData:
+    case GetM_Spec:
+      Send(Data, msg.src, p, VC3, pv, 0, UNDEFINED);
+      undefine pv;
+      ps := P_I;
+
+    case Data, InvAck, PutAck:
       -- stale response
 
     else
@@ -409,18 +449,14 @@ Begin
       pv := msg.val;
       ps := P_S;
 
-    case SpecData:
-      pv := msg.val;
-
     case Inv:
-      phint := msg.src;
       Send(InvAck, msg.src, p, VC2, UNDEFINED, 0, UNDEFINED);
-      undefine pv;
+      spec_owner := msg.src;
 
-    case SpecGetS:
-      Send(SpecNack, msg.src, p, VC2, UNDEFINED, 0, UNDEFINED);
+    case GetS_Spec, GetM_Spec:
+      Send(Spec_Fail, msg.src, p, VC3, UNDEFINED, 0, UNDEFINED);
 
-    case InvAck, PutAck, FwdAck, SpecNack:
+    case InvAck, PutAck, FwdAck, Spec_Fail:
       -- stale response
 
     else
@@ -436,11 +472,9 @@ Begin
         pack := msg.cnt;
         if prack >= pack
         then
-          undefine phint;
           ps := P_M;
         endif;
       else
-        undefine phint;
         ps := P_M;
       endif;
 
@@ -452,22 +486,15 @@ Begin
       endif;
 
     case Inv:
-      phint := msg.src;
       Send(InvAck, msg.src, p, VC2, UNDEFINED, 0, UNDEFINED);
-      if IsUndefined(pv)
-      then
-        ps := PI_M;
-        pack := 0;
-        prack := 0;
-      endif;
 
-    case SpecGetS:
-      Send(SpecNack, msg.src, p, VC2, UNDEFINED, 0, UNDEFINED);
+    case GetS_Spec, GetM_Spec:
+      Send(Spec_Fail, msg.src, p, VC3, UNDEFINED, 0, UNDEFINED);
 
     case Fwd_GetS, Fwd_GetM:
       msg_processed := false;
 
-    case PutAck, FwdAck, SpecNack, SpecData:
+    case PutAck, FwdAck, Spec_Fail:
       -- stale response
 
     else
@@ -481,7 +508,6 @@ Begin
       pack := msg.cnt;
       if prack >= pack
       then
-        undefine phint;
         ps := P_M;
       endif;
 
@@ -489,12 +515,10 @@ Begin
       prack := prack + 1;
       if (pack != 0 & prack >= pack)
       then
-        undefine phint;
         ps := P_M;
       endif;
 
     case Inv:
-      phint := msg.src;
       Send(InvAck, msg.src, p, VC2, UNDEFINED, 0, UNDEFINED);
       if IsUndefined(pv)
       then
@@ -503,13 +527,13 @@ Begin
         prack := 0;
       endif;
 
-    case SpecGetS:
-      Send(SpecNack, msg.src, p, VC2, UNDEFINED, 0, UNDEFINED);
+    case GetS_Spec, GetM_Spec:
+      Send(Spec_Fail, msg.src, p, VC3, UNDEFINED, 0, UNDEFINED);
 
     case Fwd_GetS, Fwd_GetM:
       msg_processed := false;
 
-    case PutAck, FwdAck, SpecNack, SpecData:
+    case PutAck, FwdAck, Spec_Fail:
       -- stale response
 
     else
@@ -532,13 +556,16 @@ Begin
       Send(FwdAck, HomeType, p, VC2, UNDEFINED, 0, UNDEFINED);
       ps := PM_IM;
 
+    case GetS_Spec:
+      Send(Spec_Fail, msg.src, p, VC3, UNDEFINED, 0, UNDEFINED);
+
+    case GetM_Spec:
+      Send(Spec_Fail, msg.src, p, VC3, UNDEFINED, 0, UNDEFINED);
+
     case Inv:
       Send(InvAck, msg.src, p, VC2, UNDEFINED, 0, UNDEFINED);
 
-    case SpecGetS:
-      Send(SpecNack, msg.src, p, VC2, UNDEFINED, 0, UNDEFINED);
-
-    case Data, InvAck, SpecNack, SpecData:
+    case Data, InvAck:
       -- stale response
 
     else
@@ -554,10 +581,10 @@ Begin
     case Inv:
       Send(InvAck, msg.src, p, VC2, UNDEFINED, 0, UNDEFINED);
 
-    case SpecGetS:
-      Send(SpecNack, msg.src, p, VC2, UNDEFINED, 0, UNDEFINED);
+    case GetS_Spec, GetM_Spec:
+      Send(Spec_Fail, msg.src, p, VC3, UNDEFINED, 0, UNDEFINED);
 
-    case Data, InvAck, FwdAck, SpecNack, SpecData:
+    case Data, InvAck, FwdAck:
       -- stale response
 
     else
@@ -573,10 +600,10 @@ Begin
     case Inv:
       Send(InvAck, msg.src, p, VC2, UNDEFINED, 0, UNDEFINED);
 
-    case SpecGetS:
-      Send(SpecNack, msg.src, p, VC2, UNDEFINED, 0, UNDEFINED);
+    case GetS_Spec, GetM_Spec:
+      Send(Spec_Fail, msg.src, p, VC3, UNDEFINED, 0, UNDEFINED);
 
-    case Data, InvAck, FwdAck, SpecNack, SpecData:
+    case Data, InvAck, FwdAck:
       -- stale response
 
     else
@@ -592,10 +619,97 @@ Begin
     case Inv:
       Send(InvAck, msg.src, p, VC2, UNDEFINED, 0, UNDEFINED);
 
-    case SpecGetS:
-      Send(SpecNack, msg.src, p, VC2, UNDEFINED, 0, UNDEFINED);
+    case GetS_Spec, GetM_Spec:
+      Send(Spec_Fail, msg.src, p, VC3, UNDEFINED, 0, UNDEFINED);
 
-    case Data, InvAck, FwdAck, SpecNack, SpecData:
+    case Data, InvAck, FwdAck, Spec_Fail:
+      -- stale response
+
+    else
+      ErrorUnhandledMsg(msg, p);
+    endswitch;
+
+  -- Speculative states
+  case PI_S_Spec:
+    switch msg.mtype
+    case Data:
+      pv := msg.val;
+      ps := P_S;
+
+    case Spec_Fail:
+      -- Speculative failed, send normal request
+      Send(GetS, HomeType, p, VC0, UNDEFINED, 0, UNDEFINED);
+      ps := PI_S;
+      undefine spec_owner;
+
+    case Inv:
+      Send(InvAck, msg.src, p, VC2, UNDEFINED, 0, UNDEFINED);
+      spec_owner := msg.src;
+
+    case GetS_Spec, GetM_Spec:
+      Send(Spec_Fail, msg.src, p, VC3, UNDEFINED, 0, UNDEFINED);
+
+    case InvAck, PutAck, FwdAck:
+      -- stale response
+
+    else
+      ErrorUnhandledMsg(msg, p);
+    endswitch;
+
+  case PI_M_Spec:
+    switch msg.mtype
+    case Data:
+      pv := msg.val;
+      ps := P_M;
+
+    case Spec_Fail:
+      -- Speculative failed, send normal request
+      Send(GetM, HomeType, p, VC0, UNDEFINED, 0, UNDEFINED);
+      ps := PI_M;
+      pack := 0;
+      prack := 0;
+      undefine spec_owner;
+
+    case Inv:
+      Send(InvAck, msg.src, p, VC2, UNDEFINED, 0, UNDEFINED);
+
+    case GetS_Spec, GetM_Spec:
+      Send(Spec_Fail, msg.src, p, VC3, UNDEFINED, 0, UNDEFINED);
+
+    case InvAck, PutAck, FwdAck:
+      -- stale response
+
+    else
+      ErrorUnhandledMsg(msg, p);
+    endswitch;
+
+  case PS_M_Spec:
+    switch msg.mtype
+    case Data:
+      pv := msg.val;
+      pack := 0;
+      ps := P_M;
+
+    case Spec_Fail:
+      -- Speculative failed, send normal request
+      Send(GetM, HomeType, p, VC0, UNDEFINED, 0, UNDEFINED);
+      ps := PS_M;
+      pack := 0;
+      prack := 0;
+      undefine spec_owner;
+
+    case Inv:
+      Send(InvAck, msg.src, p, VC2, UNDEFINED, 0, UNDEFINED);
+      if IsUndefined(pv)
+      then
+        ps := PI_M_Spec;
+        undefine spec_owner;
+      endif;
+
+    case GetS_Spec, GetM_Spec:
+      Send(Spec_Fail, msg.src, p, VC3, UNDEFINED, 0, UNDEFINED);
+
+    case InvAck, PutAck, FwdAck:
       -- stale response
 
     else
@@ -623,14 +737,14 @@ ruleset n:Proc do
     p.state = P_I
   ==>
     Send(GetS, HomeType, n, VC0, UNDEFINED, 0, UNDEFINED);
-    if !IsUndefined(p.owner_hint)
-    then
-      if p.owner_hint != n
-      then
-        Send(SpecGetS, p.owner_hint, n, VC0, UNDEFINED, 0, UNDEFINED);
-      endif;
-    endif;
     p.state := PI_S;
+  endrule;
+
+  rule "load speculative (I->S via cached owner)"
+    p.state = P_I & !IsUndefined(p.speculated_owner)
+  ==>
+    Send(GetS_Spec, p.speculated_owner, n, VC3, UNDEFINED, 0, UNDEFINED);
+    p.state := PI_S_Spec;
   endrule;
 
   rule "store (I->M)"
@@ -664,7 +778,6 @@ ruleset n:Proc do
     p.state = P_M
   ==>
     Send(PutM, HomeType, n, VC0, p.val, 0, UNDEFINED);
-    undefine p.owner_hint;
     p.state := PM_I;
   endrule;
 
@@ -673,7 +786,6 @@ ruleset n:Proc do
   ==>
     Send(PutS, HomeType, n, VC0, UNDEFINED, 0, UNDEFINED);
     undefine p.val;
-    undefine p.owner_hint;
     p.state := PS_I;
   endrule;
 
@@ -686,10 +798,13 @@ ruleset n:Node do
     alias msg:chan[midx] do
 
     rule "receive"
+      (msg.vc = VC3) |
       (msg.vc = VC2) |
-      (msg.vc = VC1 & MultiSetCount(m:chan, chan[m].vc = VC2) = 0) |
+      (msg.vc = VC1 & MultiSetCount(m:chan, chan[m].vc = VC2) = 0
+                     & MultiSetCount(m:chan, chan[m].vc = VC3) = 0) |
       (msg.vc = VC0 & MultiSetCount(m:chan, chan[m].vc = VC1) = 0
-                     & MultiSetCount(m:chan, chan[m].vc = VC2) = 0)
+                     & MultiSetCount(m:chan, chan[m].vc = VC2) = 0
+                     & MultiSetCount(m:chan, chan[m].vc = VC3) = 0)
     ==>
 
       if IsMember(n, Home)
@@ -733,7 +848,7 @@ startstate
     undefine Procs[i].val;
     Procs[i].acks_needed := 0;
     Procs[i].acks_received := 0;
-    undefine Procs[i].owner_hint;
+    undefine Procs[i].speculated_owner;
   endfor;
 
   undefine Net;
@@ -751,7 +866,7 @@ invariant "values in M state match last write"
 
 invariant "value is undefined while invalid"
   Forall n : Proc Do
-    Procs[n].state = P_I
+    (Procs[n].state = P_I | Procs[n].state = PI_S_Spec | Procs[n].state = PI_M_Spec)
     ->
     IsUndefined(Procs[n].val)
   end;

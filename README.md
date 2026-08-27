@@ -5,11 +5,11 @@ published for reference and portfolio purposes only.
 
 ## Contents
 
-- **`assignment1/`** — Parallel programming assignment, including source code,
-  report, and speedup ranking results.
+- **`assignment1/`** — Parallel programming assignment, including source code
+  and speedup ranking results.
 - **`assignment2/`** — Cache coherence protocol modeled in Murphi
-  (`protocol.m`), an optimized variant (`protocol_opt.m`), verification
-  outputs, and report.
+  (`protocol.m`), an optimized variant (`protocol_opt.m`), and verification
+  outputs.
 
 ## ⚠️ Academic Integrity Notice
 

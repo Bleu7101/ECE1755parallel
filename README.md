@@ -20,10 +20,11 @@ offence under the University of Toronto's
 and equivalent policies at other institutions. Plagiarism detection tools make
 copied submissions easy to identify.
 
-You are welcome to read this code to learn from it — you are not permitted to
-reuse it. See [LICENSE](LICENSE) for details.
+The MIT license below covers general reuse of the code — it does **not**
+exempt you from your institution's academic integrity rules. A permissive
+license is not permission to plagiarize.
 
 ## License
 
-All rights reserved. No permission is granted to copy, modify, or redistribute
-this work. See [LICENSE](LICENSE).
+Open source under the [MIT License](LICENSE). You're free to learn from,
+reuse, and adapt this code — just not to submit it as your own coursework.

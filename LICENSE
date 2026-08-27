@@ -1,26 +1,21 @@
+MIT License
+
 Copyright (c) 2026 Bleu7101
 
-All Rights Reserved.
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-This repository contains academic coursework and is made publicly viewable
-for reference and portfolio purposes only.
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-Permission is NOT granted to copy, reproduce, modify, adapt, merge, publish,
-distribute, sublicense, or sell any part of this work, in source or binary
-form, except as follows:
-
-1. You may view and read the contents of this repository for personal,
-   educational reference.
-2. You may fork this repository solely to the extent required by the hosting
-   platform's terms of service (e.g., GitHub's Terms of Service), without any
-   further right to use the contents.
-
-In particular, submitting any part of this work, or a derivative of it, as
-your own in an academic setting is expressly prohibited and may constitute
-an academic offence at your institution.
-
-THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM THE
-USE OF OR INABILITY TO USE THE WORK.
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
